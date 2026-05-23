@@ -1,0 +1,16 @@
+name = "sunday-api"
+main = "worker.js"
+compatibility_date = "2026-05-23"
+
+# Default model — override in dashboard or with a different vars block per env.
+[vars]
+ANTHROPIC_MODEL = "claude-sonnet-4-6"
+
+# Secrets are NOT defined here — set them with:
+#   npx wrangler secret put ANTHROPIC_API_KEY
+#
+# Custom domain (optional, do later from the dashboard):
+#   api.runworship.com → this worker
+#
+# Once deployed, the default URL will be something like:
+#   https://sunday-api.<your-account-subdomain>.workers.dev

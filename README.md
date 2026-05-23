@@ -1,23 +1,56 @@
-# Sunday Server
+# Sunday API
 
-Deploy target for the Sunday worship-team-assistant backend. Hosts the Claude proxy and Twilio WhatsApp webhook used by the [Sunday PWA](https://github.com/RM-Selah/sunday).
+The Sunday backend, deployed as a **Cloudflare Worker**. Proxies the browser app's chat requests to the Anthropic API using a server-side key, so worship leaders never have to paste one of their own.
 
-The app (HTML, schema, manifest, icons) lives in [RM-Selah/sunday](https://github.com/RM-Selah/sunday). This repo is just the headless server so it can be deployed somewhere with a stable URL (Render, Railway, Fly, Heroku, a VPS — wherever) without dragging the front-end along.
-
-## Run
-
-```bash
-cp .env.example .env   # then fill in keys
-set -a && source .env && set +a
-npm start
-```
-
-Required: `ANTHROPIC_API_KEY`. Optional: Twilio + Supabase env vars (see `.env.example`).
+Front-end repo: [RM-Selah/sunday](https://github.com/RM-Selah/sunday) (served from `https://rm-selah.github.io/sunday/`).
 
 ## Endpoints
 
-See the [main repo README](https://github.com/RM-Selah/sunday#endpoints).
+| Method | Path     | What it does |
+|--------|----------|--------------|
+| `GET`  | `/`      | Friendly landing page |
+| `GET`  | `/health`| JSON status + model + whether the API key is set |
+| `POST` | `/chat`  | Anthropic `/v1/messages` proxy. Same payload shape as Anthropic's API; the Worker injects the key. |
 
-## Keeping in sync
+## Deploy
 
-`sunday-server.js` is mirrored from [RM-Selah/sunday](https://github.com/RM-Selah/sunday). When you change it there, copy it here and push.
+One-time setup:
+
+```bash
+npm install                                # installs wrangler locally
+npx wrangler login                         # browser flow, links to your Cloudflare account
+npx wrangler secret put ANTHROPIC_API_KEY  # paste your sk-ant-... key when prompted
+npx wrangler deploy                        # ships it
+```
+
+Subsequent deploys after editing `worker.js`:
+
+```bash
+npx wrangler deploy
+```
+
+Your Worker's default URL appears in the deploy output — looks like `https://sunday-api.<account-subdomain>.workers.dev`.
+
+## Local development
+
+```bash
+npx wrangler dev
+```
+
+For local secrets, create a `.dev.vars` file (gitignored):
+
+```
+ANTHROPIC_API_KEY=sk-ant-...
+```
+
+## Custom domain (optional)
+
+In the Cloudflare dashboard:
+
+1. Pick your domain (e.g. `runworship.com`)
+2. **Workers Routes** → add `api.runworship.com/*` → `sunday-api`
+3. Update the front-end `apiUrl` to point at `https://api.runworship.com`
+
+## Legacy
+
+`sunday-server.js` is the original Node HTTP server. Kept here for reference and local-only use (`npm run start:node`). The Worker (`worker.js`) is what's deployed.
