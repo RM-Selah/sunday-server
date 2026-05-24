@@ -53,4 +53,4 @@ In the Cloudflare dashboard:
 
 ## Legacy
 
-`sunday-server.js` is the original Node HTTP server. Kept here for reference and local-only use (`npm run start:node`). The Worker (`worker.js`) is what's deployed.
+The original Node HTTP server lives in [`legacy/sunday-server.js`](legacy/) for reference. Run it locally with `npm run start:legacy`. The Worker (`worker.js`) is what's deployed.

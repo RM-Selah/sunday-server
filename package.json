@@ -9,7 +9,7 @@
     "deploy": "wrangler deploy",
     "logs": "wrangler tail",
     "set-key": "wrangler secret put ANTHROPIC_API_KEY",
-    "start:node": "node sunday-server.js"
+    "start:legacy": "node legacy/sunday-server.js"
   },
   "devDependencies": {
     "wrangler": "^3.0.0"
