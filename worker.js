@@ -25,12 +25,16 @@ const DEFAULT_MODEL = 'claude-sonnet-4-6';
 const ALLOWED_ORIGINS = new Set([
   'https://runworship.com',
   'https://www.runworship.com',
+  'http://runworship.com',          // until GH Pages cert lands — drop later
+  'http://www.runworship.com',      // ditto
   'https://runchurch.com',
   'https://www.runchurch.com',
-  'https://rm-selah.github.io',  // legacy GitHub Pages URL
-  'http://localhost:8080',       // local dev (python -m http.server)
-  'http://localhost:5173',       // vite default
-  'http://localhost:3000',       // anything else common
+  'http://runchurch.com',
+  'http://www.runchurch.com',
+  'https://rm-selah.github.io',     // legacy GitHub Pages URL
+  'http://localhost:8080',          // local dev (python -m http.server)
+  'http://localhost:5173',          // vite default
+  'http://localhost:3000',          // anything else common
   'http://127.0.0.1:8080',
 ]);
 
