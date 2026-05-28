@@ -7,8 +7,8 @@
 // Endpoints:
 //   GET  /                      → friendly health page
 //   GET  /health                → JSON status
-//   POST /auth/magic            → request magic link email
-//   POST /auth/verify           → verify magic link token → session
+//   POST /auth/code             → passcode login → session (3 levels: admin/builder/wl)
+//   POST /auth/name             → first-name lookup → session (legacy, kept for compat)
 //   GET  /members?session=TOKEN → list church members (requires session)
 //   POST /members/add           → add a member (requires admin session)
 //   POST /chat                  → Anthropic /v1/messages proxy
@@ -342,6 +342,54 @@ export default {
         churchId,
         role,
         churchName,
+        sessionExpires,
+      }, 200, cors);
+    }
+
+    // ── Passcode auth ─────────────────────────────────────────────────────────
+    // POST /auth/code  body: { code, churchId }
+    // Three shared passcodes map to access levels:
+    //   env.CODE_ADMIN   (default "admin")          → role: admin
+    //   env.CODE_BUILDER (default "builder")        → role: builder
+    //   env.CODE_WL      (default "worship leader") → role: wl
+    // userId is stable per church+role so set lists persist across sessions.
+    if (request.method === 'POST' && url.pathname === '/auth/code') {
+      if (!env.DB) return json({ error: 'DB not configured' }, 500, cors);
+      let body;
+      try { body = await request.json(); } catch(e) { return json({ error: 'Invalid JSON' }, 400, cors); }
+
+      const code     = (body.code     || '').trim().toLowerCase();
+      const churchId = (body.churchId || '').trim();
+      if (!code)     return json({ error: 'Access code required' }, 400, cors);
+      if (!churchId) return json({ error: 'Church ID required' }, 400, cors);
+
+      const codeAdmin   = (env.CODE_ADMIN   || 'admin').toLowerCase();
+      const codeBuilder = (env.CODE_BUILDER || 'builder').toLowerCase();
+      const codeWL      = (env.CODE_WL      || 'worship leader').toLowerCase();
+
+      let role;
+      if      (code === codeAdmin)   role = 'admin';
+      else if (code === codeBuilder) role = 'builder';
+      else if (code === codeWL)      role = 'wl';
+      else return json({ error: 'Incorrect access code — check with Reuben.' }, 403, cors);
+
+      const church = await env.DB.prepare('SELECT name FROM churches WHERE id = ?').bind(churchId).first();
+      if (!church) return json({ error: 'Church not found' }, 404, cors);
+
+      // Stable userId per church+role so all sessions at same level share saved sets
+      const userId = churchId.slice(0, 8) + '-' + role;
+
+      const sessionToken   = crypto.randomUUID().replace(/-/g, '');
+      const sessionExpires = new Date(Date.now() + 90 * 24 * 60 * 60 * 1000).toISOString();
+      const now            = new Date().toISOString();
+
+      await env.DB.prepare(
+        'INSERT INTO sessions (token, user_id, church_id, role, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?)'
+      ).bind(sessionToken, userId, churchId, role, sessionExpires, now).run();
+
+      return json({
+        ok: true, sessionToken, userId, churchId, role,
+        churchName: church.name || 'The Local',
         sessionExpires,
       }, 200, cors);
     }
