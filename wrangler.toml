@@ -7,6 +7,11 @@ compatibility_date = "2026-05-23"
 binding = "SUNDAY_STATE"
 id = "3e1a0ca0c40d44e6bc045c73298da329"
 
+[[d1_databases]]
+binding = "DB"
+database_name = "sunday-db"
+database_id = "afa6a0ff-3a29-4d93-b378-0564fd2107b8"
+
 [vars]
 ANTHROPIC_MODEL = "claude-sonnet-4-6"
 
