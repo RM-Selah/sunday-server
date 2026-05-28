@@ -638,26 +638,35 @@ export default {
 
       // Auth: try sessionToken first, fall back to adminKey
       let authedUserId = null;
+      let authedRole = null;
       if (body.sessionToken) {
         const session = await validateSession(env, body.sessionToken);
         if (!session || session.church_id !== churchId) return json({ error: 'Unauthorized' }, 403, cors);
         if (session.role === 'viewer') return json({ error: 'Unauthorized' }, 403, cors);
         authedUserId = session.user_id;
+        authedRole = session.role;
       } else if (body.adminKey) {
         if (body.adminKey !== keyRow.admin_key) return json({ error: 'Unauthorized' }, 403, cors);
+        authedRole = 'admin';
       } else {
         return json({ error: 'Unauthorized' }, 403, cors);
       }
 
+      // WL role can only save their own set lists — never shared roster/team/songs
+      const isWL = (authedRole === 'wl');
+
       const now = new Date().toISOString();
       const stmts = [];
 
-      // Update church name
-      if (body.churchName) {
+      // Update church name (admin/builder only)
+      if (!isWL && body.churchName) {
         stmts.push(
           env.DB.prepare('UPDATE churches SET name = ? WHERE id = ?').bind(body.churchName, churchId)
         );
       }
+
+      // Roster state, team, songs, services — admin/builder only, never WL
+      if (!isWL) {
 
       // Upsert roster state (roster JSON blob, rosterBecause, rosteringRules)
       stmts.push(env.DB.prepare(`
@@ -748,6 +757,8 @@ export default {
           ));
         }
       }
+
+      } // end if (!isWL) — roster/team/songs/services block
 
       // Execute main stmts
       await d1Batch(env.DB, stmts);
