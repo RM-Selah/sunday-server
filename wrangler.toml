@@ -3,6 +3,10 @@ main = "worker.js"
 compatibility_date = "2026-05-23"
 
 # Default model — override in dashboard or with a different vars block per env.
+[[kv_namespaces]]
+binding = "SUNDAY_STATE"
+id = "3e1a0ca0c40d44e6bc045c73298da329"
+
 [vars]
 ANTHROPIC_MODEL = "claude-sonnet-4-6"
 
