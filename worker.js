@@ -346,6 +346,74 @@ export default {
       }, 200, cors);
     }
 
+    // ── Name-based auth ───────────────────────────────────────────────────────
+    // POST /auth/name  body: { name, churchId }
+    // Looks up first name in people table, creates 90-day session.
+    // Role: tier=1 → admin; WL/CO-WL in roles → wl; otherwise → viewer
+    if (request.method === 'POST' && url.pathname === '/auth/name') {
+      if (!env.DB) return json({ error: 'DB not configured' }, 500, cors);
+      let body;
+      try { body = await request.json(); } catch(e) { return json({ error: 'Invalid JSON' }, 400, cors); }
+
+      const firstName = (body.name || '').trim();
+      const churchId  = (body.churchId || '').trim();
+      if (!firstName) return json({ error: 'Name required' }, 400, cors);
+      if (!churchId)  return json({ error: 'Church ID required' }, 400, cors);
+
+      // Find people whose name starts with the supplied first name (case-insensitive)
+      const matches = await env.DB.prepare(`
+        SELECT * FROM people
+        WHERE church_id = ? AND active = 1
+          AND (lower(name) = lower(?)
+            OR lower(name) LIKE lower(?) || ' %')
+        ORDER BY tier, name
+      `).bind(churchId, firstName, firstName).all();
+
+      const rows = matches.results || [];
+      if (rows.length === 0) {
+        return json({ error: "You're not on the team yet — ask Reuben to add you." }, 403, cors);
+      }
+      if (rows.length > 1) {
+        // Multiple people share that first name — ask for a more specific name
+        return json({ error: `There are a few people named ${firstName} — try your full name.` }, 409, cors);
+      }
+
+      const person = rows[0];
+
+      // Determine role from tier + canonical roles
+      let role = 'viewer';
+      if (person.tier === 1) {
+        role = 'admin';
+      } else {
+        const personRoles = safeJson(person.roles, []);
+        if (personRoles.includes('WL') || personRoles.includes('CO-WL')) {
+          role = 'wl';
+        }
+      }
+
+      // Create 90-day session (use people.id as user_id — no FK constraint in D1)
+      const sessionToken  = crypto.randomUUID().replace(/-/g, '');
+      const sessionExpires = new Date(Date.now() + 90 * 24 * 60 * 60 * 1000).toISOString();
+      const now = new Date().toISOString();
+
+      await env.DB.prepare(
+        'INSERT INTO sessions (token, user_id, church_id, role, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?)'
+      ).bind(sessionToken, person.id, churchId, role, sessionExpires, now).run();
+
+      const church = await env.DB.prepare('SELECT name FROM churches WHERE id = ?').bind(churchId).first();
+      const churchName = church ? (church.name || 'The Local') : 'The Local';
+
+      return json({
+        ok: true,
+        sessionToken,
+        userId: person.id,
+        churchId,
+        role,
+        churchName,
+        sessionExpires,
+      }, 200, cors);
+    }
+
     // ── List members ──────────────────────────────────────────────────────────
     // GET /members?session=TOKEN
     if (request.method === 'GET' && url.pathname === '/members') {
