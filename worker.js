@@ -7,10 +7,14 @@
 // Endpoints:
 //   GET  /                      → friendly health page
 //   GET  /health                → JSON status
+//   POST /auth/magic            → request magic link email
+//   POST /auth/verify           → verify magic link token → session
+//   GET  /members?session=TOKEN → list church members (requires session)
+//   POST /members/add           → add a member (requires admin session)
 //   POST /chat                  → Anthropic /v1/messages proxy
 //   POST /church/new            → create church record → { id, adminKey }
-//   GET  /state?church=ID       → load church state (public, read-only)
-//   POST /state?church=ID       → save church state (requires adminKey in body)
+//   GET  /state?church=ID       → load church state (public, or filtered by session)
+//   POST /state?church=ID       → save church state (requires adminKey or sessionToken)
 //   GET  /whatsapp/status       → { enabled: bool }
 //   POST /whatsapp/send         → send one WhatsApp message via Twilio
 //   POST /whatsapp/blast        → send personalised messages to a list
@@ -20,6 +24,7 @@
 //   TWILIO_ACCOUNT_SID          (required for WhatsApp)
 //   TWILIO_AUTH_TOKEN           (required for WhatsApp)
 //   TWILIO_FROM                 (required for WhatsApp — e.g. whatsapp:+14155238886)
+//   RESEND_API_KEY              (optional — email magic links; logs URL to console if missing)
 //
 // Bindings (wrangler.toml):
 //   DB                          (D1 database — sunday-db)
@@ -102,6 +107,59 @@ async function d1Batch(db, stmts) {
   }
 }
 
+// ── Auth helpers ──────────────────────────────────────────────────────────────
+
+async function validateSession(env, token) {
+  if (!token || !env.DB) return null;
+  return await env.DB.prepare(
+    'SELECT * FROM sessions WHERE token = ? AND expires_at > ?'
+  ).bind(token, new Date().toISOString()).first();
+}
+
+async function sendMagicLinkEmail(env, to, magicUrl, churchName) {
+  if (!env.RESEND_API_KEY) {
+    console.log('[dev] Magic link for', to, '→', magicUrl);
+    return { ok: true, dev: true };
+  }
+  const html = `<!DOCTYPE html>
+<html>
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
+<body style="margin:0;padding:0;background:#050507;font-family:-apple-system,sans-serif;">
+  <div style="max-width:480px;margin:40px auto;padding:32px 24px;background:#0a0a10;border-radius:12px;border:1px solid rgba(255,255,255,0.08);">
+    <div style="font-family:Georgia,serif;font-size:36px;font-weight:300;color:#e8e8f2;margin-bottom:4px;">The Local</div>
+    <div style="font-size:10px;font-weight:500;letter-spacing:3px;text-transform:uppercase;color:#38385a;margin-bottom:32px;">Worship Team</div>
+    <p style="font-size:15px;color:rgba(232,232,242,0.7);line-height:1.6;margin:0 0 28px;">
+      Here's your sign-in link for ${churchName || 'The Local'}. It expires in 30 minutes.
+    </p>
+    <a href="${magicUrl}" style="display:inline-block;background:#e09a2d;color:#050507;text-decoration:none;padding:14px 28px;border-radius:8px;font-size:15px;font-weight:600;font-family:-apple-system,sans-serif;">Sign in to The Local →</a>
+    <p style="font-size:12px;color:#38385a;margin-top:28px;line-height:1.5;">
+      If you didn't request this, you can safely ignore it.<br>
+      This link only works once.
+    </p>
+  </div>
+</body>
+</html>`;
+  const res = await fetch('https://api.resend.com/emails', {
+    method: 'POST',
+    headers: {
+      'Authorization': 'Bearer ' + env.RESEND_API_KEY,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      from: 'The Local <noreply@runworship.com>',
+      to: [to],
+      subject: 'Sign in to The Local',
+      html,
+    }),
+  });
+  if (!res.ok) {
+    const err = await res.text();
+    console.error('[resend] Error sending to', to, ':', err);
+    return { ok: false, error: err };
+  }
+  return { ok: true };
+}
+
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
@@ -131,6 +189,216 @@ export default {
       }, 200, cors);
     }
 
+    // ── Magic link request ────────────────────────────────────────────────────
+    // POST /auth/magic  body: { email, churchId? }
+    if (request.method === 'POST' && url.pathname === '/auth/magic') {
+      if (!env.DB) return json({ error: 'DB not configured' }, 500, cors);
+      let body;
+      try { body = await request.json(); } catch(e) { return json({ error: 'Invalid JSON' }, 400, cors); }
+      const email = (body.email || '').trim().toLowerCase();
+      if (!email || email.indexOf('@') < 0) return json({ error: 'Valid email required' }, 400, cors);
+
+      // Find or create user
+      let user = await env.DB.prepare('SELECT * FROM users WHERE email = ?').bind(email).first();
+      if (!user) {
+        const newId = crypto.randomUUID().replace(/-/g, '').slice(0, 16);
+        await env.DB.prepare(
+          'INSERT INTO users (id, email) VALUES (?, ?)'
+        ).bind(newId, email).run();
+        user = await env.DB.prepare('SELECT * FROM users WHERE id = ?').bind(newId).first();
+      }
+
+      // Delete any old magic links for this user
+      await env.DB.prepare('DELETE FROM magic_links WHERE user_id = ?').bind(user.id).run();
+
+      // Generate new magic token
+      const magicToken = crypto.randomUUID().replace(/-/g, '');
+      const expiresAt = new Date(Date.now() + 30 * 60 * 1000).toISOString();
+      const churchId = body.churchId || null;
+      await env.DB.prepare(
+        'INSERT INTO magic_links (token, user_id, church_id, expires_at) VALUES (?, ?, ?, ?)'
+      ).bind(magicToken, user.id, churchId, expiresAt).run();
+
+      // Determine magic URL
+      const origin = request.headers.get('Origin') || 'https://runworship.com';
+      const appOrigin = ALLOWED_ORIGINS.has(origin) ? origin : 'https://runworship.com';
+      const magicUrl = appOrigin + '/?magicToken=' + magicToken;
+
+      // Fetch church name for email
+      let churchName = 'The Local';
+      if (churchId) {
+        const ch = await env.DB.prepare('SELECT name FROM churches WHERE id = ?').bind(churchId).first();
+        if (ch) churchName = ch.name || churchName;
+      }
+
+      // Send email (or dev mode)
+      const emailResult = await sendMagicLinkEmail(env, email, magicUrl, churchName);
+      if (emailResult.dev) {
+        return json({ ok: true, dev: true, magicUrl }, 200, cors);
+      }
+      if (!emailResult.ok) {
+        return json({ ok: false, error: 'Failed to send email' }, 500, cors);
+      }
+      return json({ ok: true }, 200, cors);
+    }
+
+    // ── Magic link verify ─────────────────────────────────────────────────────
+    // POST /auth/verify  body: { token, inviteKey? }
+    if (request.method === 'POST' && url.pathname === '/auth/verify') {
+      if (!env.DB) return json({ error: 'DB not configured' }, 500, cors);
+      let body;
+      try { body = await request.json(); } catch(e) { return json({ error: 'Invalid JSON' }, 400, cors); }
+      const { token, inviteKey } = body;
+      if (!token) return json({ error: 'Token required' }, 400, cors);
+
+      const now = new Date().toISOString();
+      const link = await env.DB.prepare(
+        'SELECT * FROM magic_links WHERE token = ?'
+      ).bind(token).first();
+      if (!link) return json({ error: 'Link not found or already used' }, 404, cors);
+      if (link.expires_at < now) return json({ error: 'Link expired — request a new one' }, 410, cors);
+
+      // Delete the link (one-time use)
+      await env.DB.prepare('DELETE FROM magic_links WHERE token = ?').bind(token).run();
+
+      // Update last_sign_in
+      await env.DB.prepare(
+        'UPDATE users SET last_sign_in = ? WHERE id = ?'
+      ).bind(now, link.user_id).run();
+
+      // Determine church + role
+      let churchId = link.church_id;
+      let role = 'viewer';
+      let churchName = 'The Local';
+
+      if (churchId) {
+        // Check church_members
+        const membership = await env.DB.prepare(
+          'SELECT role FROM church_members WHERE user_id = ? AND church_id = ?'
+        ).bind(link.user_id, churchId).first();
+
+        if (membership) {
+          role = membership.role;
+        } else {
+          // Check invite key
+          const keyRow = await env.DB.prepare(
+            'SELECT admin_key FROM church_keys WHERE church_id = ?'
+          ).bind(churchId).first();
+
+          let joined = false;
+          if (inviteKey && keyRow && inviteKey === keyRow.admin_key) {
+            role = 'admin';
+            joined = true;
+          } else {
+            // First user ever for this church?
+            const memberCount = await env.DB.prepare(
+              'SELECT COUNT(*) as cnt FROM church_members WHERE church_id = ?'
+            ).bind(churchId).first();
+            if (memberCount && memberCount.cnt === 0) {
+              role = 'admin';
+              joined = true;
+            }
+          }
+
+          if (joined) {
+            await env.DB.prepare(
+              'INSERT OR REPLACE INTO church_members (user_id, church_id, role) VALUES (?, ?, ?)'
+            ).bind(link.user_id, churchId, role).run();
+          } else {
+            return json({ error: 'Not a member — ask your pastor to add you' }, 403, cors);
+          }
+        }
+
+        const ch = await env.DB.prepare('SELECT name FROM churches WHERE id = ?').bind(churchId).first();
+        if (ch) churchName = ch.name || churchName;
+      } else {
+        // No church on link — look up all memberships
+        const memberships = await env.DB.prepare(
+          'SELECT cm.church_id, cm.role, c.name FROM church_members cm LEFT JOIN churches c ON c.id = cm.church_id WHERE cm.user_id = ?'
+        ).bind(link.user_id).all();
+        const rows = memberships.results || [];
+        if (rows.length === 0) return json({ error: 'No church linked to this account — ask your pastor to add you' }, 403, cors);
+        if (rows.length === 1) {
+          churchId = rows[0].church_id;
+          role = rows[0].role;
+          churchName = rows[0].name || churchName;
+        } else {
+          // Multiple churches — return list for client to pick (future feature)
+          return json({ error: 'Multiple churches found — use a direct invite link' }, 409, cors);
+        }
+      }
+
+      // Create session (90-day)
+      const sessionToken = crypto.randomUUID().replace(/-/g, '');
+      const sessionExpires = new Date(Date.now() + 90 * 24 * 60 * 60 * 1000).toISOString();
+      await env.DB.prepare(
+        'INSERT INTO sessions (token, user_id, church_id, role, expires_at) VALUES (?, ?, ?, ?, ?)'
+      ).bind(sessionToken, link.user_id, churchId, role, sessionExpires).run();
+
+      return json({
+        ok: true,
+        sessionToken,
+        userId: link.user_id,
+        churchId,
+        role,
+        churchName,
+        sessionExpires,
+      }, 200, cors);
+    }
+
+    // ── List members ──────────────────────────────────────────────────────────
+    // GET /members?session=TOKEN
+    if (request.method === 'GET' && url.pathname === '/members') {
+      if (!env.DB) return json({ error: 'DB not configured' }, 500, cors);
+      const sessionToken = url.searchParams.get('session');
+      const session = await validateSession(env, sessionToken);
+      if (!session) return json({ error: 'Unauthorized' }, 401, cors);
+
+      const rows = await env.DB.prepare(`
+        SELECT u.id, u.email, u.name, cm.role, u.last_sign_in, cm.joined_at
+        FROM church_members cm
+        JOIN users u ON u.id = cm.user_id
+        WHERE cm.church_id = ?
+        ORDER BY cm.joined_at
+      `).bind(session.church_id).all();
+
+      return json({ members: rows.results || [] }, 200, cors);
+    }
+
+    // ── Add member ────────────────────────────────────────────────────────────
+    // POST /members/add  body: { sessionToken, email, name?, role }
+    if (request.method === 'POST' && url.pathname === '/members/add') {
+      if (!env.DB) return json({ error: 'DB not configured' }, 500, cors);
+      let body;
+      try { body = await request.json(); } catch(e) { return json({ error: 'Invalid JSON' }, 400, cors); }
+      const session = await validateSession(env, body.sessionToken);
+      if (!session) return json({ error: 'Unauthorized' }, 401, cors);
+      if (session.role === 'viewer') return json({ error: 'Admin access required' }, 403, cors);
+
+      const email = (body.email || '').trim().toLowerCase();
+      if (!email || email.indexOf('@') < 0) return json({ error: 'Valid email required' }, 400, cors);
+      const role = body.role || 'viewer';
+
+      // Find or create user
+      let user = await env.DB.prepare('SELECT * FROM users WHERE email = ?').bind(email).first();
+      if (!user) {
+        const newId = crypto.randomUUID().replace(/-/g, '').slice(0, 16);
+        await env.DB.prepare(
+          'INSERT INTO users (id, email, name) VALUES (?, ?, ?)'
+        ).bind(newId, email, body.name || null).run();
+        user = { id: newId };
+      } else if (body.name) {
+        await env.DB.prepare('UPDATE users SET name = ? WHERE id = ? AND name IS NULL').bind(body.name, user.id).run();
+      }
+
+      // Upsert membership
+      await env.DB.prepare(
+        'INSERT OR REPLACE INTO church_members (user_id, church_id, role) VALUES (?, ?, ?)'
+      ).bind(user.id, session.church_id, role).run();
+
+      return json({ ok: true, userId: user.id }, 200, cors);
+    }
+
     // ── Create church ─────────────────────────────────────────────────────────
     // POST /church/new → { id, adminKey }
     if (request.method === 'POST' && url.pathname === '/church/new') {
@@ -145,7 +413,7 @@ export default {
     }
 
     // ── Load state ────────────────────────────────────────────────────────────
-    // GET /state?church=ID → full state blob (public, no auth required)
+    // GET /state?church=ID  (optional: &session=TOKEN for set-list filtering)
     if (request.method === 'GET' && url.pathname === '/state') {
       if (!env.DB) return json({ error: 'DB not configured' }, 500, cors);
       const churchId = url.searchParams.get('church');
@@ -156,12 +424,28 @@ export default {
       ).bind(churchId).first();
       if (!church) return json({ error: 'Church not found' }, 404, cors);
 
+      // Optional session-based filtering for set_lists
+      const sessionToken = url.searchParams.get('session');
+      const session = sessionToken ? await validateSession(env, sessionToken) : null;
+
+      let setsQuery;
+      if (session && session.church_id === churchId) {
+        // Show sets saved by this user, or sets with no saved_by
+        setsQuery = env.DB.prepare(
+          'SELECT * FROM set_lists WHERE church_id = ? AND (saved_by = ? OR saved_by IS NULL) ORDER BY created_at DESC LIMIT 100'
+        ).bind(churchId, session.user_id).all();
+      } else {
+        setsQuery = env.DB.prepare(
+          'SELECT * FROM set_lists WHERE church_id = ? ORDER BY created_at DESC LIMIT 100'
+        ).bind(churchId).all();
+      }
+
       const [rosterRow, people, songs, services, sets] = await Promise.all([
         env.DB.prepare('SELECT * FROM roster_state WHERE church_id = ?').bind(churchId).first(),
         env.DB.prepare('SELECT * FROM people WHERE church_id = ? AND active = 1 ORDER BY tier, name').bind(churchId).all(),
         env.DB.prepare('SELECT * FROM songs WHERE church_id = ? ORDER BY title').bind(churchId).all(),
         env.DB.prepare('SELECT * FROM services WHERE church_id = ? ORDER BY sort_order, name').bind(churchId).all(),
-        env.DB.prepare('SELECT * FROM set_lists WHERE church_id = ? ORDER BY created_at DESC LIMIT 100').bind(churchId).all(),
+        setsQuery,
       ]);
 
       const team = (people.results || []).map(function(p) {
@@ -221,8 +505,8 @@ export default {
     }
 
     // ── Save state ────────────────────────────────────────────────────────────
-    // POST /state?church=ID  body: { adminKey, roster, rosterBecause, team, songs,
-    //                                services, savedSets, churchName, rosteringRules }
+    // POST /state?church=ID  body: { sessionToken | adminKey, roster, rosterBecause,
+    //                                team, songs, services, savedSets, churchName, rosteringRules }
     if (request.method === 'POST' && url.pathname === '/state') {
       if (!env.DB) return json({ error: 'DB not configured' }, 500, cors);
       const churchId = url.searchParams.get('church');
@@ -235,7 +519,19 @@ export default {
 
       let body;
       try { body = await request.json(); } catch(e) { return json({ error: 'Invalid JSON' }, 400, cors); }
-      if (body.adminKey !== keyRow.admin_key) return json({ error: 'Unauthorized' }, 403, cors);
+
+      // Auth: try sessionToken first, fall back to adminKey
+      let authedUserId = null;
+      if (body.sessionToken) {
+        const session = await validateSession(env, body.sessionToken);
+        if (!session || session.church_id !== churchId) return json({ error: 'Unauthorized' }, 403, cors);
+        if (session.role === 'viewer') return json({ error: 'Unauthorized' }, 403, cors);
+        authedUserId = session.user_id;
+      } else if (body.adminKey) {
+        if (body.adminKey !== keyRow.admin_key) return json({ error: 'Unauthorized' }, 403, cors);
+      } else {
+        return json({ error: 'Unauthorized' }, 403, cors);
+      }
 
       const now = new Date().toISOString();
       const stmts = [];
@@ -340,17 +636,25 @@ export default {
       // Execute main stmts
       await d1Batch(env.DB, stmts);
 
-      // Saved sets: delete all then reinsert (cleanly handles deletions)
+      // Saved sets: delete only this user's sets (or all if using adminKey), then reinsert
       if (Array.isArray(body.savedSets)) {
-        const setStmts = [
-          env.DB.prepare('DELETE FROM set_lists WHERE church_id = ?').bind(churchId)
-        ];
+        let deleteStmt;
+        if (authedUserId) {
+          // Session auth: only delete sets belonging to this user
+          deleteStmt = env.DB.prepare(
+            'DELETE FROM set_lists WHERE church_id = ? AND saved_by = ?'
+          ).bind(churchId, authedUserId);
+        } else {
+          // Legacy adminKey: delete all sets for the church (old behaviour)
+          deleteStmt = env.DB.prepare('DELETE FROM set_lists WHERE church_id = ?').bind(churchId);
+        }
+        const setStmts = [deleteStmt];
         for (var m = 0; m < body.savedSets.length; m++) {
           var set = body.savedSets[m];
           setStmts.push(env.DB.prepare(`
             INSERT INTO set_lists (id, church_id, name, month, week, service_slug,
-                                   songs, ministry, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                   songs, ministry, saved_by, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
           `).bind(
             String(set.id), churchId,
             set.name || '',
@@ -358,6 +662,7 @@ export default {
             set.service || set.service_slug || null,
             JSON.stringify(set.songs || []),
             JSON.stringify(set.ministrySongs || set.ministry || []),
+            authedUserId || null,
             set.savedAt || now, now
           ));
         }
